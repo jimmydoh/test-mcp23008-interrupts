@@ -48,7 +48,7 @@ def reset():
     for p in pico_outputs:
         p.value = False
     mcp.clear_ints()
-    time.sleep(0.1)
+    time.sleep(0.2)
 
 
 def reset_state():
@@ -79,7 +79,7 @@ def run_slow_test():
 
         # --- Test Rising Edge ---
         pico_outputs[i].value = True
-        time.sleep(0.05)
+        time.sleep(0.2)
 
         if int_listener.value == False:
             flags = mcp.int_flag
@@ -91,7 +91,7 @@ def run_slow_test():
                 print(f"  [FAIL] Flag or Cap mismatch! Flags: {flags}, Cap: {caps[i]}")
                 errors += 1
 
-            time.sleep(0.01)
+            time.sleep(0.2)
 
             if int_listener.value == False:
                 print(f"  [FAIL] Reading INTCAP did not clear the hardware interrupt!")
@@ -102,11 +102,11 @@ def run_slow_test():
             print(f"  [FAIL] No hardware interrupt signal detected on rising edge!")
             errors += 1
 
-        time.sleep(0.1)
+        time.sleep(0.2)
 
         # --- Test Falling Edge ---
         pico_outputs[i].value = False
-        time.sleep(0.05)
+        time.sleep(0.2)
 
         if int_listener.value == False:
             flags = mcp.int_flag
@@ -121,7 +121,7 @@ def run_slow_test():
             print(f"  [FAIL] No hardware interrupt signal detected on falling edge!")
             errors += 1
 
-        time.sleep(0.1)
+        time.sleep(0.2)
 
     reset()
     return errors
@@ -144,7 +144,7 @@ def run_multi_pin_test():
     pico_outputs[2].value = True
     pico_outputs[3].value = True
     pico_outputs[4].value = True
-    time.sleep(0.05)
+    time.sleep(0.2)
 
     if int_listener.value == False:
         flags = mcp.int_flag
@@ -183,41 +183,79 @@ def run_stress_test(iterations=500):
     - No missed interrupts or incorrect captures occur under rapid changes
     - The system remains responsive and accurate throughout the test duration
     """
-    print(f"\n--- Starting Rapid Stress Test ({iterations} iterations) ---")
     errors = 0
-    states = [False] * 8
-
-    reset()
-
+    states = [False] * 8 
+    
+    # 1. Explicitly guarantee a clean configuration state
+    mcp.interrupt_enable = 0xFF 
+    mcp.interrupt_configuration = 0x00 
+    mcp.default_value = 0x00
+    mcp.io_control = 0x04 # Open-drain
+    
+    # 2. Reset physical pins
+    for p in pico_outputs: 
+        p.value = False
+        
+    time.sleep(0.05) # Allow electrical lines to physically settle
+    
+    # 3. Firmly lock in the baseline latch
+    _ = mcp.gpio 
+    mcp.clear_ints()
+    
     start_time = time.monotonic()
-
+    
     for count in range(iterations):
+        iter_fail = False
         target_pin = random.randint(0, 7)
         new_state = not states[target_pin]
-
         states[target_pin] = new_state
+        
+        # Trigger the change
         pico_outputs[target_pin].value = new_state
-
+        
+        # Wait 3ms for the MCP23008 glitch filter and logic to assert INT
+        time.sleep(0.003) 
+        
         if int_listener.value == True:
             errors += 1
-            print(f"  [FAIL] Iteration {count}: INT line did not drop!")
-
+            # Diagnostic: What does the chip actually see on its pins right now?
+            live_gpio = mcp.gpio
+            live_bit = (live_gpio >> target_pin) & 1
+            iter_fail = True
+            print(f"  [FAIL] Iteration {count}: INT line did not drop! Pin {target_pin} -> {new_state}. Chip sees pin as: {live_bit}")
+        
+        # Read the snapshot data
         flags = mcp.int_flag
-        caps = mcp.int_cap # Reading this clears the interrupt for the next loop
-
+        caps = mcp.int_cap 
+        
+        # READ GPIO! This ensures the "previous state" baseline is fully 
+        # updated to the current state of all pins for the next loop.
+        _ = mcp.gpio 
+        
+        # VERY IMPORTANT: Give the silicon a tiny breathing room to reset 
+        # its internal interrupt latches before we immediately toggle the next pin.
+        time.sleep(0.002)
+        
+        # Verify accuracy
         if target_pin not in flags:
             errors += 1
+            iter_fail = True
             print(f"  [FAIL] Iteration {count}: Flag array {flags} missing expected pin {target_pin}")
-
+            
         expected_cap_val = 1 if new_state else 0
-        if caps[target_pin] != expected_cap_val:
+        if target_pin in flags and caps[target_pin] != expected_cap_val:
             errors += 1
+            iter_fail = True
             print(f"  [FAIL] Iteration {count}: INTCAP {caps[target_pin]} != Expected {expected_cap_val}")
+
+        #if not iter_fail:
+        #    print(f"  [PASS] Iteration {count}: Pin {target_pin} -> {new_state}, Flags: {flags}, Caps: {caps[target_pin]}")
+
+        if not iter_fail and count % 50 == 0:
+            print(f"  [INFO] Completed {count} iterations with {errors} errors so far.")
 
     elapsed = time.monotonic() - start_time
     print(f"Stress test complete in {elapsed:.2f} seconds.")
-
-    reset()
     return errors
 
 
@@ -277,7 +315,7 @@ def run_config_test():
     mcp.default_value = 0x00           # Pin 0 default is LOW
     mcp.interrupt_configuration = 0x01 # Pin 0 triggers when it DIFFERS from DEFVAL
     mcp.io_control = 0x04
-
+    
     pico_outputs[0].value = True # Change to HIGH (differs from DEFVAL)
     time.sleep(0.05)
     if int_listener.value == False and 0 in mcp.int_flag:
@@ -286,18 +324,25 @@ def run_config_test():
         print("  [FAIL] Failed to fire on DEFVAL difference.")
         errors += 1
 
-    mcp.clear_ints()
-
-    # Now set it back to LOW (matches DEFVAL)
-    pico_outputs[0].value = False
+    # IMPORTANT: Do NOT clear the interrupt here! 
+    # If we clear it while the pin is still HIGH, the MCP23008 will instantly
+    # re-trigger it because the pin STILL differs from DEFVAL.
+    
+    # First, return the pin to LOW (so it matches DEFVAL again).
+    # This removes the physical condition causing the interrupt.
+    pico_outputs[0].value = False 
     time.sleep(0.05)
-    # Note: Returning to the default value does NOT trigger a new interrupt
-    # under INTCON=1 mode, it only triggers when diverging from it.
+    
+    # NOW clear the interrupt that was generated from the initial change
+    mcp.clear_ints()
+    time.sleep(0.05)
+    
+    # Verify that returning to DEFVAL did not generate a *new* interrupt
     if int_listener.value == False:
          print("  [FAIL] Interrupt fired when returning to DEFVAL!")
          errors += 1
     else:
-         print("  [PASS] No interrupt when pin matches DEFVAL.")
+         print("  [PASS] No new interrupt triggered when pin matches DEFVAL.")
 
     # --- Test 4 - IOCON Push-Pull Active-High ---
     reset_state()
@@ -371,7 +416,7 @@ try:
     if total_pre_errors > 0:
         print(f"\nPre-tests finished with {total_pre_errors} errors. Aborting stress test.")
     else:
-        stress_errors = run_stress_test(500)
+        stress_errors = run_stress_test(5000)
 
         if stress_errors == 0:
             print("\nSUCCESS: All tests (Slow, Multi-pin, Config and Stress) passed with 0 errors!")
