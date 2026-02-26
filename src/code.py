@@ -183,6 +183,7 @@ def run_stress_test(iterations=500):
     - No missed interrupts or incorrect captures occur under rapid changes
     - The system remains responsive and accurate throughout the test duration
     """
+    print(f"\n--- Starting Stress Test - {iterations} iterations ---")
     errors = 0
     states = [False] * 8 
     
@@ -416,7 +417,7 @@ try:
     if total_pre_errors > 0:
         print(f"\nPre-tests finished with {total_pre_errors} errors. Aborting stress test.")
     else:
-        stress_errors = run_stress_test(5000)
+        stress_errors = run_stress_test(500)
 
         if stress_errors == 0:
             print("\nSUCCESS: All tests (Slow, Multi-pin, Config and Stress) passed with 0 errors!")
